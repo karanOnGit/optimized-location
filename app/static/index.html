@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pickup & Drop Location Manager</title>
+  <meta name="description" content="Create and manage pickup and drop locations on an interactive map within a 50km range." />
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- ─── Sidebar ─────────────────────────────────────────────────────── -->
+  <aside id="sidebar" class="sidebar">
+    <div class="sidebar-header">
+      <h1>📍 Location Manager</h1>
+      <p class="subtitle">Pickup & Drop Planner</p>
+    </div>
+
+    <!-- Create / Edit Form -->
+    <form id="locationForm" class="location-form" autocomplete="off">
+      <h2 id="formTitle">New Location Group</h2>
+
+      <div class="form-group">
+        <label for="labelInput">Group Label</label>
+        <input type="text" id="labelInput" placeholder="e.g. Morning Delivery Batch" required />
+      </div>
+
+      <div class="form-section">
+        <h3>🟢 Pickup Location</h3>
+        <div class="form-group">
+          <label for="pickupAddress">Address</label>
+          <input type="text" id="pickupAddress" placeholder="Click map or type address" required />
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="pickupLat">Latitude</label>
+            <input type="number" id="pickupLat" step="any" placeholder="28.6139" required />
+          </div>
+          <div class="form-group">
+            <label for="pickupLng">Longitude</label>
+            <input type="number" id="pickupLng" step="any" placeholder="77.2090" required />
+          </div>
+        </div>
+        <button type="button" id="btnSetPickup" class="btn btn-pickup">
+          🎯 Set Pickup on Map
+        </button>
+      </div>
+
+      <div class="form-section">
+        <h3>🔴 Drop Locations <span id="dropCount" class="badge">0</span></h3>
+        <div id="dropsList" class="drops-list"></div>
+        <div class="form-group">
+          <label for="dropAddress">Address</label>
+          <input type="text" id="dropAddress" placeholder="Optional — defaults to coordinates" />
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="dropLat">Latitude</label>
+            <input type="number" id="dropLat" step="any" min="-90" max="90" placeholder="28.7041" />
+          </div>
+          <div class="form-group">
+            <label for="dropLng">Longitude</label>
+            <input type="number" id="dropLng" step="any" min="-180" max="180" placeholder="77.1025" />
+          </div>
+        </div>
+        <button type="button" id="btnAddDrop" class="btn btn-drop">
+          ＋ Add Drop
+        </button>
+      </div>
+
+      <div class="form-actions">
+        <button type="submit" id="btnSubmit" class="btn btn-primary">💾 Save Location Group</button>
+        <button type="button" id="btnCancel" class="btn btn-ghost" style="display:none;">Cancel</button>
+      </div>
+    </form>
+
+    <hr class="divider" />
+
+    <!-- Existing Location Groups -->
+    <div class="saved-section">
+      <h2>Saved Groups</h2>
+      <div id="tripSummary" class="trip-summary" style="display:none;">
+        <label class="trip-toggle">
+          <input type="checkbox" id="tripToggle" checked />
+          <span>Stoppage route</span>
+        </label>
+        <div id="tripInfo" class="trip-info"></div>
+      </div>
+      <div id="savedList" class="saved-list">
+        <p class="empty-state">No location groups yet. Create one above!</p>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ─── Map ─────────────────────────────────────────────────────────── -->
+  <main id="mapContainer">
+    <div id="map"></div>
+    <div id="toast" class="toast hidden"></div>
+    <!-- Range Indicator -->
+    <div id="rangeInfo" class="range-info">
+      <span>Max range: <strong>50 km</strong></span>
+    </div>
+  </main>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
