@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 
 from app.core.database import connect_db, close_db
 from app.routes.locations import router as locations_router
+from app.routes.geocode import router as geocode_router
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -47,6 +48,7 @@ app.add_middleware(
 
 # API routes
 app.include_router(locations_router)
+app.include_router(geocode_router)
 
 # Serve the static frontend
 static_dir = BASE_DIR / "app" / "static"

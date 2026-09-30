@@ -147,6 +147,14 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     });
   });
+  setupPlaceSearch("pickup", (place) => {
+    setPickup(place.lat, place.lng, placeAddress(place));
+    map.setView([place.lat, place.lng], 14);
+  });
+  setupPlaceSearch("drop", (place) => {
+    addDrop(place.lat, place.lng, placeAddress(place));
+    map.panTo([place.lat, place.lng]);
+  });
   document.getElementById("locationForm").addEventListener("submit", onFormSubmit);
   document.getElementById("btnCancel").addEventListener("click", resetForm);
 
@@ -166,6 +174,81 @@ document.addEventListener("DOMContentLoaded", () => {
 
   loadSavedLocations();
 });
+
+// ── Place Search (geocoding) ─────────────────────────────────────────────
+
+const SOURCE_LABELS = {
+  coordinates: "Coordinates",
+  google_maps_link: "Google Maps link",
+  google_places: "Google Places",
+  nominatim: "OpenStreetMap",
+};
+
+/** Address to store for a geocoded place: include the place name if the address lacks it. */
+function placeAddress(place) {
+  return place.address.startsWith(place.name) ? place.address : `${place.name}, ${place.address}`;
+}
+
+/**
+ * Wire up a "Find place" box (ids: <prefix>Search, btn<Prefix>Search, <prefix>Results).
+ * A single match is applied immediately; several matches are listed to pick from.
+ */
+function setupPlaceSearch(prefix, onPick) {
+  const input = document.getElementById(`${prefix}Search`);
+  const button = document.getElementById(`btn${prefix[0].toUpperCase()}${prefix.slice(1)}Search`);
+  const results = document.getElementById(`${prefix}Results`);
+
+  const pick = (place) => {
+    results.innerHTML = "";
+    input.value = "";
+    onPick(place);
+  };
+
+  async function search() {
+    const q = input.value.trim();
+    if (q.length < 2) return;
+    results.innerHTML = '<div class="search-status">Searching…</div>';
+    try {
+      const res = await fetch(`/api/geocode?q=${encodeURIComponent(q)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+
+      if (data.length === 0) {
+        results.innerHTML =
+          '<div class="search-status">No match. Try a nearby area/street, or paste the place\'s Google Maps link.</div>';
+        return;
+      }
+      if (data.length === 1) {
+        pick(data[0]);
+        toast(`Found: ${data[0].name}`, "success");
+        return;
+      }
+      results.innerHTML = "";
+      data.forEach((place) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "search-result";
+        btn.innerHTML =
+          `<div class="result-name">${escapeHtml(place.name)}</div>` +
+          `<div class="result-meta">${place.lat.toFixed(5)}, ${place.lng.toFixed(5)} · ` +
+          `${SOURCE_LABELS[place.source] || place.source} · ${escapeHtml(place.address)}</div>`;
+        btn.addEventListener("click", () => pick(place));
+        results.appendChild(btn);
+      });
+    } catch (err) {
+      results.innerHTML = "";
+      toast("Place search failed: " + err.message, "error");
+    }
+  }
+
+  button.addEventListener("click", search);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      search();
+    }
+  });
+}
 
 // ── OSRM Routing ─────────────────────────────────────────────────────────
 
@@ -262,10 +345,10 @@ function onMapClick(e) {
 }
 
 // ── Pickup ───────────────────────────────────────────────────────────────
-function setPickup(lat, lng) {
+function setPickup(lat, lng, address = null) {
   document.getElementById("pickupLat").value = lat.toFixed(6);
   document.getElementById("pickupLng").value = lng.toFixed(6);
-  document.getElementById("pickupAddress").value = `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+  document.getElementById("pickupAddress").value = address || `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
 
   // Remove old marker/circle
   if (pickupMarker) allMarkerLayers.removeLayer(pickupMarker);
@@ -812,7 +895,7 @@ async function editLocation(id) {
     document.getElementById("pickupLng").value = loc.pickup.lng;
 
     // Set pickup marker on map
-    setPickup(loc.pickup.lat, loc.pickup.lng);
+    setPickup(loc.pickup.lat, loc.pickup.lng, loc.pickup.address);
 
     // Clear and reload drops
     clearDropMarkers();

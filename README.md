@@ -64,6 +64,7 @@ Then open **http://localhost:8000** for the interactive map, or **http://localho
 | `PUT`    | `/api/locations/{id}`     | Update a location group                  |
 | `DELETE` | `/api/locations/{id}`     | Delete a location group                  |
 | `GET`    | `/api/locations/nearby`   | Find drops near a point (geospatial)     |
+| `GET`    | `/api/geocode?q=...`      | Place name / Google Maps link → lat, lng |
 
 ## 🗺 Map Features
 
@@ -82,5 +83,17 @@ Edit `.env` to change defaults:
 MONGODB_URL=mongodb://localhost:27017
 DATABASE_NAME=grouping_algo
 MAX_RANGE_KM=50.0
+GOOGLE_MAPS_API_KEY=   # optional — enables Google Places name search
 ```
+
+### 🔍 Place search
+
+The **Find place** box on pickup and drops accepts:
+
+- a **Google Maps link** (full URL or `maps.app.goo.gl` short link) — the exact pin
+  coordinates are read from the link, no API key needed;
+- a **place name** — searched with Google Places (API (New), Text Search) when
+  `GOOGLE_MAPS_API_KEY` is set, otherwise OpenStreetMap Nominatim (free, but weak on
+  individual business names);
+- raw **`lat, lng`** text.
 # optimized-location

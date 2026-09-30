@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     database_name: str = "grouping_algo"
     max_range_km: float = 50.0
     carto_api_url: str | None = None
+    google_maps_api_key: str | None = None  # enables Google Places name search
+    nominatim_url: str = "https://nominatim.openstreetmap.org/search"
 
     class Config:
         env_file = ".env"

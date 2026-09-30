@@ -414,6 +414,56 @@ body {
   margin-right: 12px;
 }
 
+/* ── Place Search ─────────────────────────────────────────────────────── */
+.search-row {
+  display: flex;
+  gap: 6px;
+}
+.search-row input { flex: 1; min-width: 0; }
+.btn-search {
+  flex: 0 0 auto;
+  width: auto;
+  padding: 0 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+}
+.btn-search:hover { background: var(--bg-hover); }
+.search-results:empty { display: none; }
+.search-results {
+  margin-top: 6px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.search-result {
+  display: block;
+  width: 100%;
+  padding: 8px 12px;
+  text-align: left;
+  font: inherit;
+  color: var(--text-primary);
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.search-result:last-child { border-bottom: none; }
+.search-result:hover { background: var(--bg-hover); }
+.search-result .result-name { font-size: 0.82rem; font-weight: 600; }
+.search-result .result-meta {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.search-status {
+  padding: 8px 12px;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
 /* ── Stoppage Route ───────────────────────────────────────────────────── */
 .trip-summary {
   margin-bottom: 12px;
