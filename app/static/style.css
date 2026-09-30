@@ -608,3 +608,8 @@ body {
   }
   #mapContainer { height: 50vh; }
 }
+
+.trip-note {
+  color: var(--text-muted);
+  font-style: italic;
+}

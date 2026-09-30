@@ -736,63 +736,186 @@ function farthestPickupDropPair(stops) {
   return best;
 }
 
+const OSRM_BASE = OSRM.replace(/\/route\/v1\/driving$/, "");
+const EXACT_MAX_STOPS = 11; // exact search limit per phase (work grows as n² · 2ⁿ)
+
 /**
- * Ask OSRM's trip service for the shortest driving order that starts at
- * points[0], ends at points[last] and visits every point in between.
- * Returns { order: [inputIdx,...], coords, distance_km, duration_min } or null.
+ * Road distance matrix (metres) between all points via OSRM's table service.
+ * Falls back to straight-line distances. Returns { matrix, road }.
  */
-async function fetchTrip(points) {
+async function fetchDistanceMatrix(points) {
+  const straight = (a, b) => haversine(a.lat, a.lng, b.lat, b.lng) * 1000;
   try {
     const coordStr = points.map((p) => `${p.lng},${p.lat}`).join(";");
-    const url = `${OSRM.replace("/route/", "/trip/")}/${coordStr}` +
-      "?source=first&destination=last&roundtrip=false&overview=full&geometries=geojson";
-    const res = await fetch(url);
+    const res = await fetch(`${OSRM_BASE}/table/v1/driving/${coordStr}?annotations=distance`);
     const data = await res.json();
-    if (data.code !== "Ok" || !data.trips || data.trips.length === 0) return null;
+    if (data.code !== "Ok" || !data.distances) throw new Error(data.message || data.code);
+    // Unroutable pairs come back as null — use straight-line distance for those
+    const matrix = data.distances.map((row, i) =>
+      row.map((d, j) => d ?? straight(points[i], points[j]))
+    );
+    return { matrix, road: true };
+  } catch (err) {
+    console.warn("OSRM table failed, using straight-line distances:", err);
+    return { matrix: points.map((a) => points.map((b) => straight(a, b))), road: false };
+  }
+}
 
-    const trip = data.trips[0];
-    // waypoints[i].waypoint_index = position of input i within the trip
-    const order = data.waypoints
-      .map((w, inputIdx) => ({ inputIdx, pos: w.waypoint_index }))
-      .sort((a, b) => a.pos - b.pos)
-      .map((w) => w.inputIdx);
-
+/** Fetch the driving route that visits `points` in the given order. */
+async function fetchMultiStopRoute(points) {
+  try {
+    const coordStr = points.map((p) => `${p.lng},${p.lat}`).join(";");
+    const res = await fetch(`${OSRM}/${coordStr}?overview=full&geometries=geojson`);
+    const data = await res.json();
+    if (data.code !== "Ok" || !data.routes || data.routes.length === 0) return null;
+    const route = data.routes[0];
     return {
-      order,
-      coords: trip.geometry.coordinates.map(([lng, lat]) => [lat, lng]),
-      distance_km: +(trip.distance / 1000).toFixed(2),
-      duration_min: +(trip.duration / 60).toFixed(1),
+      coords: route.geometry.coordinates.map(([lng, lat]) => [lat, lng]),
+      distance_km: +(route.distance / 1000).toFixed(2),
+      duration_min: +(route.duration / 60).toFixed(1),
     };
   } catch (err) {
-    console.warn("OSRM trip failed:", err);
+    console.warn("OSRM multi-stop route failed:", err);
     return null;
   }
 }
 
-/** Fallback ordering: nearest-neighbour from the first point, last point fixed at the end. */
-function nearestNeighbourOrder(points) {
-  const last = points.length - 1;
-  const remaining = new Set(points.map((_, i) => i).slice(1, last));
-  const order = [0];
+function pathCost(dist, path) {
+  let cost = 0;
+  for (let i = 1; i < path.length; i++) cost += dist[path[i - 1]][path[i]];
+  return cost;
+}
+
+function nearestNeighbourPath(dist, start, nodes) {
+  const remaining = new Set(nodes);
+  const path = [start];
   while (remaining.size) {
-    const cur = points[order[order.length - 1]];
+    const cur = path[path.length - 1];
     let next = null;
-    let nextDist = Infinity;
-    for (const i of remaining) {
-      const dist = haversine(cur.lat, cur.lng, points[i].lat, points[i].lng);
-      if (dist < nextDist) { nextDist = dist; next = i; }
+    for (const k of remaining) {
+      if (next === null || dist[cur][k] < dist[cur][next]) next = k;
     }
-    order.push(next);
+    path.push(next);
     remaining.delete(next);
   }
-  if (last > 0) order.push(last);
-  return order;
+  return path;
+}
+
+/** Improve an open path (first point fixed, end free) by reversing segments. */
+function twoOpt(dist, path) {
+  let best = path;
+  let bestCost = pathCost(dist, path);
+  let improved = true;
+  while (improved) {
+    improved = false;
+    for (let i = 1; i < best.length - 1; i++) {
+      for (let j = i + 1; j < best.length; j++) {
+        const cand = [...best.slice(0, i), ...best.slice(i, j + 1).reverse(), ...best.slice(j + 1)];
+        const cost = pathCost(dist, cand);
+        if (cost < bestCost - 1e-6) {
+          best = cand;
+          bestCost = cost;
+          improved = true;
+        }
+      }
+    }
+  }
+  return best;
 }
 
 /**
- * Draw a second route across ALL saved points: it starts at the pickup and
- * ends at the drop that are farthest apart, and visits every other saved
- * point as a numbered stoppage in the shortest order found.
+ * Shortest open path that starts at `start` and visits every index in `nodes`.
+ * Returns the best path for EACH possible end node: [{ end, cost, path, exact }].
+ *
+ * Up to EXACT_MAX_STOPS nodes this compares every possible order exactly
+ * (Held-Karp dynamic programming); above that it uses nearest-neighbour + 2-opt.
+ */
+function shortestPathsByEnd(dist, start, nodes) {
+  const n = nodes.length;
+  if (n === 0) return [{ end: start, cost: 0, path: [start], exact: true }];
+  if (n > EXACT_MAX_STOPS) {
+    const path = twoOpt(dist, nearestNeighbourPath(dist, start, nodes));
+    return [{ end: path[path.length - 1], cost: pathCost(dist, path), path, exact: false }];
+  }
+
+  const full = (1 << n) - 1;
+  // dp[mask * n + j] = cheapest start → (all nodes in mask) path ending at nodes[j]
+  const dp = new Float64Array((full + 1) * n).fill(Infinity);
+  const parent = new Int8Array((full + 1) * n).fill(-1);
+  for (let j = 0; j < n; j++) dp[(1 << j) * n + j] = dist[start][nodes[j]];
+
+  for (let mask = 1; mask <= full; mask++) {
+    for (let j = 0; j < n; j++) {
+      const cur = dp[mask * n + j];
+      if (!(mask & (1 << j)) || cur === Infinity) continue;
+      for (let k = 0; k < n; k++) {
+        if (mask & (1 << k)) continue;
+        const idx = (mask | (1 << k)) * n + k;
+        const cost = cur + dist[nodes[j]][nodes[k]];
+        if (cost < dp[idx]) {
+          dp[idx] = cost;
+          parent[idx] = j;
+        }
+      }
+    }
+  }
+
+  return nodes.map((end, j) => {
+    const path = [];
+    let mask = full;
+    let k = j;
+    while (k !== -1) {
+      path.push(nodes[k]);
+      const prev = parent[mask * n + k];
+      mask ^= 1 << k;
+      k = prev;
+    }
+    path.push(start);
+    return { end, cost: dp[full * n + j], path: path.reverse(), exact: true };
+  });
+}
+
+/**
+ * Plan the stoppage route: start pickup → all other pickups → all drops.
+ * For every candidate last pickup, every order of the drops is compared; the
+ * drop that finishes the overall shortest path becomes the END location.
+ */
+function planStoppageRoute(points, dist, startIdx) {
+  const pickups = [];
+  const drops = [];
+  points.forEach((p, i) => {
+    if (i !== startIdx) (p.kind === "pickup" ? pickups : drops).push(i);
+  });
+
+  let best = null;
+  for (const pk of shortestPathsByEnd(dist, startIdx, pickups)) {
+    for (const dr of shortestPathsByEnd(dist, pk.end, drops)) {
+      const cost = pk.cost + dr.cost;
+      if (!best || cost < best.cost) {
+        best = {
+          cost,
+          order: [...pk.path, ...dr.path.slice(1)],
+          lastPickup: pk.end,
+          exact: pk.exact && dr.exact,
+        };
+      }
+    }
+  }
+  best.dropCount = drops.length;
+  return best;
+}
+
+function factorial(n) {
+  let f = 1;
+  for (let i = 2; i <= n; i++) f *= i;
+  return f;
+}
+
+/**
+ * Draw a second route across ALL saved points. It starts at the pickup of the
+ * farthest-apart pickup/drop pair, collects every pickup, then — from the last
+ * pickup — follows the shortest of all possible drop orders. The drop that
+ * ends that shortest path is the end location.
  */
 async function renderStoppageRoute(locations) {
   tripLayer.clearLayers();
@@ -800,52 +923,49 @@ async function renderStoppageRoute(locations) {
   const summary = document.getElementById("tripSummary");
   const info = document.getElementById("tripInfo");
 
-  const stops = collectStops(locations);
-  const pair = farthestPickupDropPair(stops);
+  const points = collectStops(locations);
+  const pair = farthestPickupDropPair(points);
   if (!pair) {
     summary.style.display = "none";
     return;
   }
 
-  // Order the points so the start is first and the end is last
-  const [startIdx, endIdx] = pair;
-  const points = [
-    stops[startIdx],
-    ...stops.filter((_, i) => i !== startIdx && i !== endIdx),
-    stops[endIdx],
-  ];
-
   summary.style.display = "";
-  info.textContent = "Calculating shortest route…";
+  info.textContent = "Comparing all paths…";
 
   const seq = ++tripRenderSeq;
-  const trip = await fetchTrip(points);
+  const { matrix, road } = await fetchDistanceMatrix(points);
   if (seq !== tripRenderSeq) return; // a newer render has started
-  const order = trip ? trip.order : nearestNeighbourOrder(points);
-  const ordered = order.map((i) => points[i]);
+
+  const plan = planStoppageRoute(points, matrix, pair[0]);
+  const ordered = plan.order.map((i) => points[i]);
+
+  const route = await fetchMultiStopRoute(ordered);
+  if (seq !== tripRenderSeq) return;
 
   // Route line: real roads from OSRM, or straight segments as a fallback
   const lineOpts = { pane: "tripPane", color: "#0e7490", lineCap: "round", lineJoin: "round" };
-  if (trip) {
-    L.polyline(trip.coords, { ...lineOpts, weight: 9, opacity: 0.25 }).addTo(tripLayer);
-    L.polyline(trip.coords, { ...lineOpts, weight: 4, opacity: 0.95 }).addTo(tripLayer);
+  if (route) {
+    L.polyline(route.coords, { ...lineOpts, weight: 9, opacity: 0.25 }).addTo(tripLayer);
+    L.polyline(route.coords, { ...lineOpts, weight: 4, opacity: 0.95 }).addTo(tripLayer);
   } else {
     L.polyline(ordered.map((p) => [p.lat, p.lng]), { ...lineOpts, weight: 3, opacity: 0.8, dashArray: "10 6" })
       .addTo(tripLayer);
   }
 
-  // Numbered stoppage markers
+  // Numbered stoppage markers (green = pickup, red = drop)
+  const last = ordered.length - 1;
   ordered.forEach((p, n) => {
-    const tag = n === 0 ? "Start" : n === ordered.length - 1 ? "End" : `Stop ${n}`;
+    const tag = n === 0 ? "Start" : n === last ? "End (shortest)" : `Stop ${n}`;
     L.circleMarker([p.lat, p.lng], {
       pane: "tripPane",
-      radius: 5,
+      radius: 6,
       color: "#fff",
       weight: 2,
-      fillColor: "#0e7490",
+      fillColor: p.kind === "pickup" ? "#16a34a" : "#dc2626",
       fillOpacity: 1,
     })
-      .bindTooltip(n === 0 ? "S" : n === ordered.length - 1 ? "E" : String(n), {
+      .bindTooltip(n === 0 ? "S" : n === last ? "E" : String(n), {
         permanent: true,
         direction: "top",
         offset: [0, -8],
@@ -855,15 +975,19 @@ async function renderStoppageRoute(locations) {
       .addTo(tripLayer);
   });
 
-  const start = ordered[0];
-  const end = ordered[ordered.length - 1];
-  const totals = trip
-    ? `${trip.distance_km} km · ${trip.duration_min} min driving`
-    : "Routing unavailable — showing straight-line order";
+  const totals = route
+    ? `${route.distance_km} km · ${route.duration_min} min driving`
+    : `≈ ${(plan.cost / 1000).toFixed(2)} km (${road ? "road" : "straight-line"} estimate)`;
+  const compared = plan.exact
+    ? `All ${factorial(plan.dropCount).toLocaleString()} drop orders compared`
+    : "Too many stops to compare every order — best found shown";
   info.innerHTML =
     `${escapeHtml(totals)}<br>` +
-    `${ordered.length} points · ${Math.max(ordered.length - 2, 0)} stoppages<br>` +
-    `Start: ${escapeHtml(start.name)}<br>End: ${escapeHtml(end.name)}`;
+    `${ordered.length} points · pickups first, then drops<br>` +
+    `Start: ${escapeHtml(ordered[0].name)}<br>` +
+    `Last pickup: ${escapeHtml(points[plan.lastPickup].name)}<br>` +
+    `End (shortest): ${escapeHtml(ordered[last].name)}<br>` +
+    `<span class="trip-note">${escapeHtml(compared)}${road ? "" : " (straight-line distances)"}</span>`;
 }
 
 function escapeHtml(s) {
