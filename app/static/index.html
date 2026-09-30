@@ -63,6 +63,7 @@
       <div class="form-section">
         <h3>🔴 Drop Locations <span id="dropCount" class="badge">0</span></h3>
         <div id="dropsList" class="drops-list"></div>
+        <div id="shortestInfo" class="shortest-info" style="display:none;"></div>
         <div class="form-group">
           <label for="dropSearch">Find place</label>
           <div class="search-row">
@@ -104,8 +105,12 @@
       <div id="tripSummary" class="trip-summary" style="display:none;">
         <label class="trip-toggle">
           <input type="checkbox" id="tripToggle" checked />
-          <span>Stoppage route</span>
+          <span>Batch routes <small>(max 3 pickups + 3 drops)</small></span>
         </label>
+        <select id="batchMode" class="batch-mode" title="How batches are formed">
+          <option value="fill">Prefer fewer batches (fill up to 3 + 3)</option>
+          <option value="distance">Prefer less driving (km per drop)</option>
+        </select>
         <div id="tripInfo" class="trip-info"></div>
       </div>
       <div id="savedList" class="saved-list">

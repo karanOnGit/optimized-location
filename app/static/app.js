@@ -18,6 +18,11 @@ let allMarkerLayers = L.layerGroup();
 let savedGroupLayers = {}; // id → layerGroup
 let tripLayer = L.layerGroup(); // stoppage route across all saved points
 let tripRenderSeq = 0; // ignore stale trip responses
+let lastLocations = []; // last loaded saved groups, for re-batching
+let shortestLayer = L.featureGroup(); // shortest path for the group being created/edited
+let shortestSeq = 0; // ignore stale shortest-path responses
+let shortestTimer = null;
+const SHORTEST_COLOR = "#111827";
 
 // Custom icons
 const pickupIcon = L.divIcon({
@@ -98,7 +103,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Stoppage route sits above the per-group routes but below markers
   map.createPane("tripPane").style.zIndex = 450;
+  // Form's shortest path sits above every other route line
+  map.createPane("shortestPane").style.zIndex = 460;
+  shortestLayer.addTo(map);
   tripLayer.addTo(map);
+  document.getElementById("batchMode").addEventListener("change", () => renderBatchRoutes(lastLocations));
   document.getElementById("tripToggle").addEventListener("change", (e) => {
     if (e.target.checked) tripLayer.addTo(map);
     else tripLayer.remove();
@@ -532,6 +541,7 @@ function updateDropDistances() {
 }
 
 function renderDropsList() {
+  scheduleShortestPath();
   const container = document.getElementById("dropsList");
   document.getElementById("dropCount").textContent = drops.length;
 
@@ -561,6 +571,65 @@ function renderDropsList() {
         </div>`;
     })
     .join("");
+}
+
+// ── Shortest Path (form) ─────────────────────────────────────────────────
+
+/** Recompute the form's shortest path shortly after the last change. */
+function scheduleShortestPath() {
+  clearTimeout(shortestTimer);
+  shortestTimer = setTimeout(renderShortestPath, 300);
+}
+
+/**
+ * For the group being created/edited: find the shortest path that starts at
+ * the pickup and visits every drop (all drop orders compared), and draw it in
+ * SHORTEST_COLOR above the individual pickup → drop routes.
+ */
+async function renderShortestPath() {
+  const seq = ++shortestSeq;
+  shortestLayer.clearLayers();
+  const info = document.getElementById("shortestInfo");
+
+  const pickupLat = parseFloat(document.getElementById("pickupLat").value);
+  const pickupLng = parseFloat(document.getElementById("pickupLng").value);
+  if (isNaN(pickupLat) || isNaN(pickupLng) || drops.length === 0) {
+    info.style.display = "none";
+    return;
+  }
+
+  info.style.display = "";
+  info.textContent = "Finding shortest path…";
+
+  const points = [
+    { lat: pickupLat, lng: pickupLng, kind: "pickup" },
+    ...drops.map((d) => ({ lat: d.lat, lng: d.lng, kind: "drop" })),
+  ];
+  const { matrix, road } = await fetchDistanceMatrix(points);
+  if (seq !== shortestSeq) return; // form changed meanwhile
+  const plan = planRoute(points, matrix, points.map((_, i) => i));
+  const ordered = plan.order.map((i) => points[i]);
+
+  const route = await fetchMultiStopRoute(ordered);
+  if (seq !== shortestSeq) return;
+
+  const coords = route ? route.coords : ordered.map((p) => [p.lat, p.lng]);
+  const opts = { pane: "shortestPane", lineCap: "round", lineJoin: "round" };
+  L.polyline(coords, { ...opts, color: "#fff", weight: 9, opacity: 0.9 }).addTo(shortestLayer);
+  L.polyline(coords, { ...opts, color: SHORTEST_COLOR, weight: 5, opacity: 1, dashArray: route ? null : "10 6" })
+    .bindPopup("<strong>Shortest path</strong>")
+    .addTo(shortestLayer);
+
+  // plan.order holds point indices; drop #n is point index n
+  const visitOrder = ["Pickup", ...plan.order.slice(1).map((i) => `#${i}`)].join(" → ");
+  const totals = route
+    ? `${route.distance_km} km · ${route.duration_min} min`
+    : `≈ ${(plan.cost / 1000).toFixed(2)} km (${road ? "road" : "straight-line"} estimate)`;
+  const exact = drops.length <= EXACT_MAX_STOPS;
+  info.innerHTML =
+    `<span class="shortest-swatch"></span><strong>Shortest path</strong> · ${escapeHtml(totals)}<br>` +
+    `<span class="trip-note">${escapeHtml(visitOrder)}` +
+    `${exact ? "" : " (approximate — too many drops to compare every order)"}</span>`;
 }
 
 // ── Form Submit ──────────────────────────────────────────────────────────
@@ -619,7 +688,8 @@ async function loadSavedLocations() {
     const locations = await res.json();
     renderSavedList(locations);
     renderSavedMarkers(locations);
-    renderStoppageRoute(locations);
+    lastLocations = locations;
+    renderBatchRoutes(locations);
   } catch (err) {
     console.error("Failed to load locations:", err);
   }
@@ -701,43 +771,38 @@ async function renderSavedMarkers(locations) {
   }
 }
 
-// ── Stoppage Route ───────────────────────────────────────────────────────
+// ── Batch Routes ─────────────────────────────────────────────────────────
+
+const BATCH_MAX_PICKUPS = 3;
+const BATCH_MAX_DROPS = 3;
+const BATCH_COLORS = ["#0e7490", "#be185d", "#4d7c0f", "#b45309", "#6d28d9", "#0369a1"];
 
 /**
- * Flatten all saved groups into a list of stops.
- * Each stop: { lat, lng, kind: 'pickup'|'drop', name }.
+ * Flatten saved groups into points and "units". A unit is one pickup plus the
+ * drops that travel with it, and is never split across batches. Groups with
+ * more than BATCH_MAX_DROPS drops are chunked, so their pickup is visited once
+ * per chunk.
+ * Point: { lat, lng, kind: 'pickup'|'drop', name }. Unit: { pickup, drops: [pointIdx] }.
  */
-function collectStops(locations) {
-  const stops = [];
+function buildUnits(locations) {
+  const points = [];
+  const units = [];
   for (const loc of locations) {
-    stops.push({ lat: loc.pickup.lat, lng: loc.pickup.lng, kind: "pickup", name: `${loc.label} — Pickup` });
-    loc.drops.forEach((d, i) => {
-      stops.push({ lat: d.lat, lng: d.lng, kind: "drop", name: `${loc.label} — Drop #${i + 1}` });
-    });
+    for (let c = 0; c < loc.drops.length; c += BATCH_MAX_DROPS) {
+      const pickup = points.push({
+        lat: loc.pickup.lat, lng: loc.pickup.lng, kind: "pickup", name: `${loc.label} — Pickup`,
+      }) - 1;
+      const drops = loc.drops.slice(c, c + BATCH_MAX_DROPS).map((d, i) =>
+        points.push({ lat: d.lat, lng: d.lng, kind: "drop", name: `${loc.label} — Drop #${c + i + 1}` }) - 1
+      );
+      units.push({ pickup, drops });
+    }
   }
-  return stops;
-}
-
-/** Return [pickupIdx, dropIdx] of the pickup/drop pair that are farthest apart. */
-function farthestPickupDropPair(stops) {
-  let best = null;
-  let bestDist = -1;
-  stops.forEach((p, pi) => {
-    if (p.kind !== "pickup") return;
-    stops.forEach((d, di) => {
-      if (d.kind !== "drop") return;
-      const dist = haversine(p.lat, p.lng, d.lat, d.lng);
-      if (dist > bestDist) {
-        bestDist = dist;
-        best = [pi, di];
-      }
-    });
-  });
-  return best;
+  return { points, units };
 }
 
 const OSRM_BASE = OSRM.replace(/\/route\/v1\/driving$/, "");
-const EXACT_MAX_STOPS = 11; // exact search limit per phase (work grows as n² · 2ⁿ)
+const EXACT_MAX_STOPS = 12; // compare every order up to this many stops (work grows as n² · 2ⁿ)
 
 /**
  * Road distance matrix (metres) between all points via OSRM's table service.
@@ -780,62 +845,28 @@ async function fetchMultiStopRoute(points) {
   }
 }
 
-function pathCost(dist, path) {
-  let cost = 0;
-  for (let i = 1; i < path.length; i++) cost += dist[path[i - 1]][path[i]];
-  return cost;
-}
-
-function nearestNeighbourPath(dist, start, nodes) {
-  const remaining = new Set(nodes);
-  const path = [start];
-  while (remaining.size) {
-    const cur = path[path.length - 1];
-    let next = null;
-    for (const k of remaining) {
-      if (next === null || dist[cur][k] < dist[cur][next]) next = k;
-    }
-    path.push(next);
-    remaining.delete(next);
-  }
-  return path;
-}
-
-/** Improve an open path (first point fixed, end free) by reversing segments. */
-function twoOpt(dist, path) {
-  let best = path;
-  let bestCost = pathCost(dist, path);
-  let improved = true;
-  while (improved) {
-    improved = false;
-    for (let i = 1; i < best.length - 1; i++) {
-      for (let j = i + 1; j < best.length; j++) {
-        const cand = [...best.slice(0, i), ...best.slice(i, j + 1).reverse(), ...best.slice(j + 1)];
-        const cost = pathCost(dist, cand);
-        if (cost < bestCost - 1e-6) {
-          best = cand;
-          bestCost = cost;
-          improved = true;
-        }
-      }
-    }
-  }
-  return best;
-}
-
 /**
  * Shortest open path that starts at `start` and visits every index in `nodes`.
- * Returns the best path for EACH possible end node: [{ end, cost, path, exact }].
- *
- * Up to EXACT_MAX_STOPS nodes this compares every possible order exactly
- * (Held-Karp dynamic programming); above that it uses nearest-neighbour + 2-opt.
+ * Returns the best path for EACH possible end node: [{ end, cost, path }].
+ * Compares every possible order exactly (Held-Karp dynamic programming).
  */
 function shortestPathsByEnd(dist, start, nodes) {
   const n = nodes.length;
-  if (n === 0) return [{ end: start, cost: 0, path: [start], exact: true }];
+  if (n === 0) return [{ end: start, cost: 0, path: [start] }];
   if (n > EXACT_MAX_STOPS) {
-    const path = twoOpt(dist, nearestNeighbourPath(dist, start, nodes));
-    return [{ end: path[path.length - 1], cost: pathCost(dist, path), path, exact: false }];
+    // Too many orders to compare exactly — greedy nearest-neighbour instead
+    const path = [start];
+    let cost = 0;
+    const left = new Set(nodes);
+    while (left.size) {
+      const cur = path[path.length - 1];
+      let next = null;
+      for (const k of left) if (next === null || dist[cur][k] < dist[cur][next]) next = k;
+      cost += dist[cur][next];
+      path.push(next);
+      left.delete(next);
+    }
+    return [{ end: path[path.length - 1], cost, path }];
   }
 
   const full = (1 << n) - 1;
@@ -871,123 +902,201 @@ function shortestPathsByEnd(dist, start, nodes) {
       k = prev;
     }
     path.push(start);
-    return { end, cost: dp[full * n + j], path: path.reverse(), exact: true };
+    return { end, cost: dp[full * n + j], path: path.reverse() };
   });
 }
 
 /**
- * Plan the stoppage route: start pickup → all other pickups → all drops.
- * For every candidate last pickup, every order of the drops is compared; the
- * drop that finishes the overall shortest path becomes the END location.
+ * Shortest route over the given point indices: pickups first, then drops.
+ * Every pickup is tried as the start; from each possible last pickup every
+ * drop order is compared, and the drop finishing the shortest path is the end.
  */
-function planStoppageRoute(points, dist, startIdx) {
-  const pickups = [];
-  const drops = [];
-  points.forEach((p, i) => {
-    if (i !== startIdx) (p.kind === "pickup" ? pickups : drops).push(i);
-  });
-
+function planRoute(points, dist, indices) {
+  const pickups = indices.filter((i) => points[i].kind === "pickup");
+  const drops = indices.filter((i) => points[i].kind === "drop");
   let best = null;
-  for (const pk of shortestPathsByEnd(dist, startIdx, pickups)) {
-    for (const dr of shortestPathsByEnd(dist, pk.end, drops)) {
-      const cost = pk.cost + dr.cost;
-      if (!best || cost < best.cost) {
-        best = {
-          cost,
-          order: [...pk.path, ...dr.path.slice(1)],
-          lastPickup: pk.end,
-          exact: pk.exact && dr.exact,
-        };
+  for (const start of pickups) {
+    const others = pickups.filter((i) => i !== start);
+    for (const pk of shortestPathsByEnd(dist, start, others)) {
+      for (const dr of shortestPathsByEnd(dist, pk.end, drops)) {
+        const cost = pk.cost + dr.cost;
+        if (!best || cost < best.cost) {
+          best = { cost, order: [...pk.path, ...dr.path.slice(1)], lastPickup: pk.end };
+        }
       }
     }
   }
-  best.dropCount = drops.length;
   return best;
 }
 
-function factorial(n) {
-  let f = 1;
-  for (let i = 2; i <= n; i++) f *= i;
-  return f;
+/**
+ * Split all units into batches of at most BATCH_MAX_PICKUPS pickups and
+ * BATCH_MAX_DROPS drops. Batches are formed one at a time and never share a unit:
+ *   1. Seed with the unit holding the farthest-apart pickup/drop pair still
+ *      left, so outlying points are served first instead of being stranded.
+ *   2. Try every combination of remaining units (pickup within MAX_RANGE_KM
+ *      of the seed's pickup) that fits the capacity and keep the best:
+ *      - prefer "fill": most drops, ties broken by the shortest route
+ *        (fewer batches, more driving);
+ *      - prefer "distance": lowest route distance per drop
+ *        (less driving, more batches).
+ *   3. Remove the chosen units and repeat with what is left.
+ */
+function formBatches(points, dist, units, prefer = "fill") {
+  const km = (a, b) => haversine(points[a].lat, points[a].lng, points[b].lat, points[b].lng);
+  const dropCount = (combo) => combo.reduce((n, u) => n + units[u].drops.length, 0);
+  const fits = (combo) => combo.length <= BATCH_MAX_PICKUPS && dropCount(combo) <= BATCH_MAX_DROPS;
+
+  const remaining = new Set(units.keys());
+  const batches = [];
+
+  while (remaining.size) {
+    // 1. Seed
+    let seed = null;
+    let seedDist = -1;
+    for (const u of remaining) {
+      for (const v of remaining) {
+        for (const d of units[v].drops) {
+          const k = km(units[u].pickup, d);
+          if (k > seedDist) { seedDist = k; seed = u; }
+        }
+      }
+    }
+
+    // 2. Every capacity-fitting combination of nearby units with the seed
+    const candidates = [...remaining].filter(
+      (u) => u !== seed && km(units[u].pickup, units[seed].pickup) <= MAX_RANGE_KM
+    );
+    const combos = [[seed]];
+    const extend = (combo, from) => {
+      for (let i = from; i < candidates.length; i++) {
+        const next = [...combo, candidates[i]];
+        if (fits(next)) {
+          combos.push(next);
+          extend(next, i + 1);
+        }
+      }
+    };
+    extend([seed], 0);
+
+    let best = null;
+    for (const combo of combos) {
+      const drops = dropCount(combo);
+      if (prefer === "fill" && best && drops < best.drops) continue;
+      const plan = planRoute(points, dist, combo.flatMap((u) => [units[u].pickup, ...units[u].drops]));
+      const better = !best || (prefer === "distance"
+        ? plan.cost / drops < best.plan.cost / best.drops
+        : drops > best.drops || plan.cost < best.plan.cost);
+      if (better) best = { combo, drops, plan };
+    }
+
+    // 3. Lock in this batch
+    best.combo.forEach((u) => remaining.delete(u));
+    batches.push({ units: best.combo, plan: best.plan });
+  }
+  return batches;
 }
 
 /**
- * Draw a second route across ALL saved points. It starts at the pickup of the
- * farthest-apart pickup/drop pair, collects every pickup, then — from the last
- * pickup — follows the shortest of all possible drop orders. The drop that
- * ends that shortest path is the end location.
+ * Group all saved pickups/drops into batches (max 3 pickups + 3 drops each)
+ * and draw each batch's shortest route in its own colour.
  */
-async function renderStoppageRoute(locations) {
+async function renderBatchRoutes(locations) {
   tripLayer.clearLayers();
-  ++tripRenderSeq;
+  const seq = ++tripRenderSeq;
   const summary = document.getElementById("tripSummary");
   const info = document.getElementById("tripInfo");
 
-  const points = collectStops(locations);
-  const pair = farthestPickupDropPair(points);
-  if (!pair) {
+  const { points, units } = buildUnits(locations);
+  if (units.length === 0) {
     summary.style.display = "none";
     return;
   }
 
   summary.style.display = "";
-  info.textContent = "Comparing all paths…";
+  info.textContent = "Forming batches…";
 
-  const seq = ++tripRenderSeq;
   const { matrix, road } = await fetchDistanceMatrix(points);
   if (seq !== tripRenderSeq) return; // a newer render has started
+  const batches = formBatches(points, matrix, units, document.getElementById("batchMode").value);
 
-  const plan = planStoppageRoute(points, matrix, pair[0]);
-  const ordered = plan.order.map((i) => points[i]);
+  const layers = [];
+  const rows = [];
+  let totalKm = 0;
 
-  const route = await fetchMultiStopRoute(ordered);
-  if (seq !== tripRenderSeq) return;
+  for (let b = 0; b < batches.length; b++) {
+    info.textContent = `Routing batch ${b + 1} of ${batches.length}…`;
+    const { plan } = batches[b];
+    const ordered = plan.order.map((i) => points[i]);
+    const route = await fetchMultiStopRoute(ordered);
+    if (seq !== tripRenderSeq) return;
 
-  // Route line: real roads from OSRM, or straight segments as a fallback
-  const lineOpts = { pane: "tripPane", color: "#0e7490", lineCap: "round", lineJoin: "round" };
-  if (route) {
-    L.polyline(route.coords, { ...lineOpts, weight: 9, opacity: 0.25 }).addTo(tripLayer);
-    L.polyline(route.coords, { ...lineOpts, weight: 4, opacity: 0.95 }).addTo(tripLayer);
-  } else {
-    L.polyline(ordered.map((p) => [p.lat, p.lng]), { ...lineOpts, weight: 3, opacity: 0.8, dashArray: "10 6" })
-      .addTo(tripLayer);
+    const color = BATCH_COLORS[b % BATCH_COLORS.length];
+    const layer = L.featureGroup().addTo(tripLayer);
+    layers.push(layer);
+
+    // Route line: real roads from OSRM, or straight segments as a fallback
+    const lineOpts = { pane: "tripPane", color, lineCap: "round", lineJoin: "round" };
+    if (route) {
+      L.polyline(route.coords, { ...lineOpts, weight: 9, opacity: 0.2 }).addTo(layer);
+      L.polyline(route.coords, { ...lineOpts, weight: 4, opacity: 0.95 }).addTo(layer);
+    } else {
+      L.polyline(ordered.map((p) => [p.lat, p.lng]), { ...lineOpts, weight: 3, opacity: 0.8, dashArray: "10 6" })
+        .addTo(layer);
+    }
+
+    // Stop markers (green = pickup, red = drop), labelled "<batch>·S / 1 / 2 / E"
+    const last = ordered.length - 1;
+    ordered.forEach((p, n) => {
+      const step = n === 0 ? "S" : n === last ? "E" : String(n);
+      const tag = n === 0 ? "Start" : n === last ? "End (shortest)" : `Stop ${n}`;
+      L.circleMarker([p.lat, p.lng], {
+        pane: "tripPane",
+        radius: 6,
+        color,
+        weight: 3,
+        fillColor: p.kind === "pickup" ? "#16a34a" : "#dc2626",
+        fillOpacity: 1,
+      })
+        .bindTooltip(`${b + 1}·${step}`, {
+          permanent: true,
+          direction: "top",
+          offset: [0, -8],
+          className: `stop-label batch-${b % BATCH_COLORS.length}`,
+        })
+        .bindPopup(
+          `<strong>Batch ${b + 1} — ${tag}</strong><br>${escapeHtml(p.name)}<br>` +
+          `${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}`
+        )
+        .addTo(layer);
+    });
+
+    const km = route ? route.distance_km : +(plan.cost / 1000).toFixed(2);
+    totalKm += km;
+    const pickups = ordered.filter((p) => p.kind === "pickup").length;
+    const drops = ordered.length - pickups;
+    const time = route ? ` · ${route.duration_min} min` : " (estimate)";
+    rows.push(
+      `<div class="batch-row" data-batch="${b}">` +
+      `<span class="batch-dot" style="background:${color};"></span>` +
+      `<div><strong>Batch ${b + 1}</strong> · ${pickups}P / ${drops}D · ${km} km${time}<br>` +
+      `<span class="trip-note">${escapeHtml(ordered[0].name)} → ${escapeHtml(ordered[last].name)}</span></div>` +
+      `</div>`
+    );
   }
 
-  // Numbered stoppage markers (green = pickup, red = drop)
-  const last = ordered.length - 1;
-  ordered.forEach((p, n) => {
-    const tag = n === 0 ? "Start" : n === last ? "End (shortest)" : `Stop ${n}`;
-    L.circleMarker([p.lat, p.lng], {
-      pane: "tripPane",
-      radius: 6,
-      color: "#fff",
-      weight: 2,
-      fillColor: p.kind === "pickup" ? "#16a34a" : "#dc2626",
-      fillOpacity: 1,
-    })
-      .bindTooltip(n === 0 ? "S" : n === last ? "E" : String(n), {
-        permanent: true,
-        direction: "top",
-        offset: [0, -8],
-        className: "stop-label",
-      })
-      .bindPopup(`<strong>${tag}</strong><br>${escapeHtml(p.name)}<br>${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}`)
-      .addTo(tripLayer);
-  });
-
-  const totals = route
-    ? `${route.distance_km} km · ${route.duration_min} min driving`
-    : `≈ ${(plan.cost / 1000).toFixed(2)} km (${road ? "road" : "straight-line"} estimate)`;
-  const compared = plan.exact
-    ? `All ${factorial(plan.dropCount).toLocaleString()} drop orders compared`
-    : "Too many stops to compare every order — best found shown";
   info.innerHTML =
-    `${escapeHtml(totals)}<br>` +
-    `${ordered.length} points · pickups first, then drops<br>` +
-    `Start: ${escapeHtml(ordered[0].name)}<br>` +
-    `Last pickup: ${escapeHtml(points[plan.lastPickup].name)}<br>` +
-    `End (shortest): ${escapeHtml(ordered[last].name)}<br>` +
-    `<span class="trip-note">${escapeHtml(compared)}${road ? "" : " (straight-line distances)"}</span>`;
+    `${batches.length} batch${batches.length > 1 ? "es" : ""} · max ${BATCH_MAX_PICKUPS} pickups + ` +
+    `${BATCH_MAX_DROPS} drops each · ${totalKm.toFixed(2)} km total` +
+    (road ? "" : " <span class=\"trip-note\">(straight-line distances)</span>") +
+    rows.join("");
+
+  // Click a batch to zoom to it
+  info.querySelectorAll(".batch-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      map.fitBounds(layers[+row.dataset.batch].getBounds().pad(0.2));
+    });
+  });
 }
 
 function escapeHtml(s) {
