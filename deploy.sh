@@ -27,13 +27,9 @@ if ! command -v docker compose &> /dev/null; then
     sudo apt-get install -y docker-compose-plugin
 fi
 
-# ── 4. Create project directory ──────────────────────────────────
-APP_DIR="/home/$USER/grouping-algo"
-echo "📁 Setting up project at $APP_DIR..."
-
-if [ ! -d "$APP_DIR" ]; then
-    mkdir -p "$APP_DIR"
-fi
+# ── 4. Navigate to project directory ─────────────────────────────
+APP_DIR="/var/www/optimized-location"
+echo "📁 Using project at $APP_DIR..."
 
 cd "$APP_DIR"
 
