@@ -1,7 +1,7 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════
 # EC2 Deployment Script — Pickup & Drop Location Manager
-# Run this on a fresh Ubuntu EC2 instance
+# Run with: sudo bash deploy.sh
 # ═══════════════════════════════════════════════════════════════════
 
 set -e
@@ -10,27 +10,29 @@ echo "🚀 Starting deployment..."
 
 # ── 1. System updates ────────────────────────────────────────────
 echo "📦 Updating system packages..."
-sudo apt-get update -y
-sudo apt-get upgrade -y
+apt-get update -y
+apt-get upgrade -y
 
 # ── 2. Install Docker ────────────────────────────────────────────
 echo "🐳 Installing Docker..."
 if ! command -v docker &> /dev/null; then
-    curl -fsSL https://get.docker.com | sudo sh
-    sudo usermod -aG docker $USER
-    echo "✅ Docker installed. You may need to log out and back in for group changes."
+    curl -fsSL https://get.docker.com | sh
+    usermod -aG docker ubuntu
+    echo "✅ Docker installed."
 fi
 
 # ── 3. Install Docker Compose ────────────────────────────────────
 echo "🐳 Installing Docker Compose..."
 if ! command -v docker compose &> /dev/null; then
-    sudo apt-get install -y docker-compose-plugin
+    apt-get install -y docker-compose-plugin
 fi
 
 # ── 4. Navigate to project directory ─────────────────────────────
 APP_DIR="/var/www/optimized-location"
 echo "📁 Using project at $APP_DIR..."
 
+# Fix ownership so containers can read files
+chown -R ubuntu:ubuntu "$APP_DIR"
 cd "$APP_DIR"
 
 # ── 5. Create .env file (edit these values!) ─────────────────────
@@ -45,14 +47,17 @@ EOF
     echo "⚠️  Review and update .env with your actual credentials!"
 fi
 
-# ── 6. Build and start containers ────────────────────────────────
+# ── 6. Create nginx directory if missing ─────────────────────────
+mkdir -p nginx
+
+# ── 7. Build and start containers ────────────────────────────────
 echo "🏗️  Building Docker images..."
-sudo docker compose build
+docker compose build
 
 echo "🟢 Starting services..."
-sudo docker compose up -d
+docker compose up -d
 
-# ── 7. Verify ────────────────────────────────────────────────────
+# ── 8. Verify ────────────────────────────────────────────────────
 echo ""
 echo "═══════════════════════════════════════════════════════"
 echo "✅ Deployment complete!"
@@ -62,8 +67,8 @@ echo "🌐 App:      http://$(curl -s ifconfig.me)"
 echo "📡 API Docs: http://$(curl -s ifconfig.me)/docs"
 echo ""
 echo "📋 Useful commands:"
-echo "   docker compose logs -f        # View logs"
-echo "   docker compose restart        # Restart"
-echo "   docker compose down           # Stop"
-echo "   docker compose up -d --build  # Rebuild & restart"
+echo "   sudo docker compose logs -f        # View logs"
+echo "   sudo docker compose restart        # Restart"
+echo "   sudo docker compose down           # Stop"
+echo "   sudo docker compose up -d --build  # Rebuild & restart"
 echo ""
